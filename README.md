@@ -1,470 +1,759 @@
-## Table of contents
+# NestJS Security Guide
 
-1. [Big picture: the request pipeline](#1-big-picture-the-request-pipeline)
-2. [Step 2 — Authentication with JWT](#2-step-2--authentication-with-jwt)
-3. [Step 3 — Protecting routes with guards](#3-step-3--protecting-routes-with-guards)
-4. [Step 4 — Storing the JWT in an httpOnly cookie](#4-step-4--storing-the-jwt-in-an-httponly-cookie)
-5. [Step 5 — Role-based access control (RBAC)](#5-step-5--role-based-access-control-rbac)
-6. [Step 6 — Rate limiting with @nestjs/throttler](#6-step-6--rate-limiting-with-nestjsthrottler)
-7. [Step 7 — CSRF protection](#7-step-7--csrf-protection)
-8. [Step 8 — CORS](#8-step-8--cors)
-9. [Step 9 — Helmet, Content Security Policy and nonces](#9-step-9--helmet-content-security-policy-and-nonces)
-10. [Cross-cutting issues found in the codebase](#10-cross-cutting-issues-found-in-the-codebase)
-11. [Prioritised improvement backlog](#11-prioritised-improvement-backlog)
-12. [General security principles to take away](#12-general-security-principles-to-take-away)
+A practical guide to securing NestJS applications, and web APIs in general. Each section
+explains what the control is, why it exists, how to put it in place in NestJS, and the
+mistakes people commonly make with it.
 
 ---
 
-## 1. Big picture: the request pipeline
+## Table of contents
 
-Every security control in NestJS lives at a specific point in the request lifecycle.
-Knowing the order tells you *where* a control belongs:
+1. [The request pipeline: where each control belongs](#1-the-request-pipeline-where-each-control-belongs)
+2. [Authentication: passwords and JWTs](#2-authentication-passwords-and-jwts)
+3. [Where to store the token: header vs cookie](#3-where-to-store-the-token-header-vs-cookie)
+4. [Authorization: deny by default, roles and ownership](#4-authorization-deny-by-default-roles-and-ownership)
+5. [Input validation](#5-input-validation)
+6. [Output: don't leak sensitive data](#6-output-dont-leak-sensitive-data)
+7. [Error handling](#7-error-handling)
+8. [Rate limiting](#8-rate-limiting)
+9. [CSRF protection](#9-csrf-protection)
+10. [CORS](#10-cors)
+11. [Security headers and Content Security Policy](#11-security-headers-and-content-security-policy)
+12. [Database security](#12-database-security)
+13. [Configuration and secrets](#13-configuration-and-secrets)
+14. [Dependencies and supply chain](#14-dependencies-and-supply-chain)
+15. [Logging and monitoring](#15-logging-and-monitoring)
+16. [Transport and deployment](#16-transport-and-deployment)
+17. [Hardening checklist](#17-hardening-checklist)
+18. [General principles](#18-general-principles)
+
+---
+
+## 1. The request pipeline: where each control belongs
+
+Every NestJS security control runs at a particular stage of the request lifecycle. If you
+know the order, you know where a control belongs:
 
 ```
 Incoming request
   │
-  ├─ Express middleware (app.use)      → helmet, cors, cookie-parser, csurf, nonce
-  ├─ Nest middleware (NestMiddleware)  → per-route middleware
-  ├─ Guards (CanActivate)              → authentication (JwtAuthGuard), authorization (RolesGuard), ThrottlerGuard
-  ├─ Interceptors (before)             → logging, serialization setup
-  ├─ Pipes                             → ValidationPipe, ParseIntPipe
-  ├─ Controller handler
-  ├─ Interceptors (after)              → ClassSerializerInterceptor (strip secrets from responses)
-  └─ Exception filters                 → map errors to safe HTTP responses
+  ├─ Express/Fastify middleware (app.use)  → helmet, CORS, cookie parsing, CSRF, CSP nonce
+  ├─ Nest middleware (NestMiddleware)      → route-scoped middleware
+  ├─ Guards (CanActivate)                  → rate limiting, authentication, authorization
+  ├─ Interceptors (before handler)         → logging, timing
+  ├─ Pipes                                 → validation and transformation (ValidationPipe, ParseIntPipe)
+  ├─ Route handler
+  ├─ Interceptors (after handler)          → response serialization (strip secrets)
+  └─ Exception filters                     → turn errors into safe HTTP responses
 ```
 
-Rules of thumb:
-
-- **Middleware** handles transport-level concerns (headers, cookies, CORS, CSRF) that do
-  not need to know which handler will run.
-- **Guards** answer "may this request reach the handler?". They have access to the
-  `ExecutionContext` and therefore to metadata such as `@Roles()`.
-- **Pipes** answer "is this input well-formed?".
-- **Interceptors / filters** control what leaves the server.
+- **Middleware** deals with transport-level concerns (headers, cookies, CORS, CSRF) that
+  don't depend on which handler will run.
+- **Guards** decide "may this request reach the handler?". They can read the
+  `ExecutionContext`, so they can see route metadata such as `@Roles()` or `@Public()`.
+- **Pipes** decide "is this input well-formed?".
+- **Interceptors and exception filters** control what leaves the server.
 
 ---
 
-## 2. Step 2 — Authentication with JWT
+## 2. Authentication: passwords and JWTs
 
-**Files:** [auth.module.ts](src/auth/auth.module.ts), [auth.service.ts](src/auth/auth.service.ts), [jwt-auth.guard.ts](src/auth/jwt-auth.guard.ts)
+### 2.1 Password storage
 
-### What the lab teaches
+- Never store plain-text passwords, and never use a fast hash such as MD5 or SHA-256 for
+  them. Use a slow, salted password-hashing algorithm: **Argon2id** (OWASP's first
+  choice) or **bcrypt** with a cost factor of at least 12.
+- Compare with the library's own verify function (`bcrypt.compare`, `argon2.verify`).
+  These functions handle the salt and run in constant time.
+- bcrypt silently ignores input beyond **72 bytes**, so enforce a maximum password length
+  (or use Argon2id instead).
+- Enforce password length with a real validator (`@MinLength(12)`). A `minLength` in
+  Swagger/OpenAPI metadata is documentation only and validates nothing.
 
-- Register `JwtModule` asynchronously so the secret and expiry come from configuration,
-  never from source code (`configService.getOrThrow('JWT_SECRET')`).
-- Passwords are stored as **bcrypt hashes** and compared with `bcrypt.compare` — the
-  plain password is never stored or compared directly.
-- On successful login the server signs a JWT with `sub` (user id), `username` and `role`.
-- A custom `JwtAuthGuard` extracts the token, verifies its signature and expiry, and
-  attaches the payload to `request.user`. Any failure → `401 Unauthorized`.
+### 2.2 Don't reveal which accounts exist
 
-### Why it matters
+A login endpoint leaks information in two ways:
 
-A JWT is a **bearer credential**: whoever holds it *is* the user until it expires. Its
-integrity rests entirely on the secret, so secret handling and expiry are as important as
-the verification code.
-
-### Weaknesses & improvements
-
-| # | Issue | Where | Fix |
-|---|-------|-------|-----|
-| 2.1 | **User enumeration via error message.** `src` returns `"User with such username cannot be found"` vs `"Invalid credentials"`. An attacker can discover valid usernames. | [auth.service.ts:16-20](src/auth/auth.service.ts#L16-L20) | Always return the same generic message (the `endingState` version does this correctly). |
-| 2.2 | **User enumeration via timing.** When the user doesn't exist, `bcrypt.compare` is skipped, so the response is measurably faster. | [auth.service.ts](src/auth/auth.service.ts) | Compare against a dummy hash when the user is missing so both paths cost the same. |
-| 2.3 | **Scheme not checked.** The guard accepts `Authorization: Anything <token>`. | [jwt-auth.guard.ts:31-36](src/auth/jwt-auth.guard.ts#L31-L36) | Require `type === 'Bearer'`. |
-| 2.4 | **Algorithm not pinned.** `verify()` accepts whatever `alg` the library allows by default. | guard / module | Set `verifyOptions: { algorithms: ['HS256'] }` (or move to `RS256`/`EdDSA` with key pairs if other services must verify tokens). |
-| 2.5 | **No `iss` / `aud` claims.** A token minted for another service using the same secret would be accepted. | module | Add `issuer` and `audience` to `signOptions` and `verifyOptions`. |
-| 2.6 | **Secret read twice, inconsistently.** The guard re-reads `JWT_SECRET` with `get()` (may be `undefined`) instead of relying on the module config. | [jwt-auth.guard.ts:43](src/auth/jwt-auth.guard.ts#L43) | Call `this.jwtService.verifyAsync(token)` with no explicit secret — the module already has it. |
-| 2.7 | **No revocation / logout.** A stolen token stays valid until expiry; a demoted admin keeps `role: admin` in their token. | design | Short-lived access tokens (5–15 min) + rotating refresh tokens stored server-side, or a `tokenVersion` column checked on each request. |
-| 2.8 | **Manual `iat`.** `jsonwebtoken` already sets `iat`. | [auth.service.ts](src/auth/auth.service.ts) | Remove it to avoid clock mistakes. |
-| 2.9 | **Weak secret risk.** `.env.example` only says "replace-with-a-long-random-secret". | [.env.example](.env.example) | Validate config at boot (e.g. Joi / zod schema in `ConfigModule.forRoot({ validationSchema })`) and require ≥ 32 random bytes. |
-
-Example of a hardened login:
+1. **Different error messages.** "User not found" and "Wrong password" tell an attacker
+   which usernames are valid. Always return one generic message, such as
+   `Invalid credentials`.
+2. **Different response times.** If the handler skips the password hash when the user
+   doesn't exist, that path is measurably faster. Hash against a dummy value so both paths
+   take the same time.
 
 ```ts
-// Pre-computed once: bcrypt.hashSync('dummy-password', 12)
-const DUMMY_HASH = '$2a$12$C6UzMDM.H6dfI/f/IKcEeO...';
+import { randomBytes } from 'crypto';
+import * as bcrypt from 'bcryptjs';
+
+// Computed once at startup: a valid hash that no real password will match.
+const DUMMY_HASH = bcrypt.hashSync(randomBytes(32).toString('hex'), 12);
 
 async login(username: string, password: string) {
-  const user = await this.usersService.findByUsername(username);
-  const ok = await bcrypt.compare(password, user?.password ?? DUMMY_HASH);
-  if (!user || !ok) throw new UnauthorizedException('Invalid credentials');
+  const user = await this.usersService.findByUsernameWithPassword(username);
+  const valid = await bcrypt.compare(password, user?.password ?? DUMMY_HASH);
 
-  return {
-    access_token: await this.jwtService.signAsync({ sub: user.id, role: user.role }),
-  };
+  if (!user || !valid) {
+    throw new UnauthorizedException('Invalid credentials');
+  }
+
+  return this.jwtService.signAsync({ sub: user.id, role: user.role });
 }
 ```
 
+The same rule applies to registration and password-reset endpoints. For example, "Email
+already registered" also reveals which accounts exist, so return a neutral response there
+too.
+
+### 2.3 JSON Web Tokens
+
+A JWT is a **bearer credential**: whoever holds it is treated as that user until it
+expires. It is signed, not encrypted, so anyone holding it can read the payload.
+
+**Configure `JwtModule` from validated configuration, never from hard-coded values:**
+
+```ts
+JwtModule.registerAsync({
+  inject: [ConfigService],
+  useFactory: (config: ConfigService) => ({
+    secret: config.getOrThrow<string>('JWT_SECRET'),
+    signOptions: {
+      expiresIn: config.getOrThrow<string>('JWT_EXPIRATION'), // e.g. '15m'
+      issuer: 'my-api',
+      audience: 'my-frontend',
+    },
+    verifyOptions: {
+      algorithms: ['HS256'], // pin the algorithm
+      issuer: 'my-api',
+      audience: 'my-frontend',
+    },
+  }),
+}),
+```
+
+Best practices:
+
+| Practice | Why |
+|----------|-----|
+| Use a secret of at least 256 random bits, loaded from a secret store | Short HMAC secrets can be brute-forced offline from any captured token. |
+| Pin the accepted `algorithms` | Prevents algorithm-confusion attacks (`alg: none`, RS256→HS256). |
+| Set and verify `iss` and `aud` | Stops a token minted for another service with the same key from being accepted. |
+| Use short-lived access tokens (5–15 min) | Limits how long a stolen token can be used. |
+| Use rotating refresh tokens stored server-side | Lets you revoke sessions and log users out for real. |
+| Keep claims minimal (`sub`, `role`) and never put secrets or personal data in them | The payload is only base64url-encoded, so anyone can read it. |
+| Don't set `iat` by hand | The library sets it correctly. |
+| Let `JwtService` use its module config when verifying | Re-reading the secret elsewhere (possibly as `undefined`) causes subtle bugs. |
+
+**A minimal authentication guard:**
+
+```ts
+@Injectable()
+export class JwtAuthGuard implements CanActivate {
+  constructor(private readonly jwt: JwtService, private readonly reflector: Reflector) {}
+
+  async canActivate(ctx: ExecutionContext): Promise<boolean> {
+    const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
+      ctx.getHandler(),
+      ctx.getClass(),
+    ]);
+    if (isPublic) return true;
+
+    const req = ctx.switchToHttp().getRequest<Request>();
+    const [type, token] = req.headers.authorization?.split(' ') ?? [];
+    if (type !== 'Bearer' || !token) throw new UnauthorizedException();
+
+    try {
+      req.user = await this.jwt.verifyAsync(token);
+    } catch {
+      throw new UnauthorizedException();
+    }
+    return true;
+  }
+}
+```
+
+Note that the guard checks the `Bearer` scheme explicitly. Taking whatever sits after the
+first space accepts malformed headers.
+
+**Revocation.** A plain JWT cannot be revoked. If a user logs out, changes their password,
+or loses a role, their existing token stays valid until it expires. Mitigations:
+
+- short access-token TTL plus server-side refresh tokens that you can delete;
+- a `tokenVersion` column on the user, embedded in the token and compared on each request;
+- a deny-list of revoked `jti` values in Redis.
+
 ---
 
-## 3. Step 3 — Protecting routes with guards
+## 3. Where to store the token: header vs cookie
 
-**Files:** [articles.controller.ts](src/articles/articles.controller.ts), [users.controller.ts](src/users/users.controller.ts), [auth.controller.ts](src/auth/auth.controller.ts)
+| Storage | Can XSS steal the token? | Is CSRF possible? |
+|---------|---------------------------|-------------------|
+| `localStorage` + `Authorization: Bearer` header | **Yes**: any injected script can read it | No: the browser never attaches it automatically |
+| `httpOnly` cookie | No: JavaScript cannot read it | **Yes**: the browser attaches it automatically (see [§9](#9-csrf-protection)) |
 
-### What the lab teaches
+Neither option is free. Cookies are generally preferred for browser clients, but they
+**require** CSRF defences. Bearer headers suit non-browser clients (mobile, server to
+server).
 
-- `@UseGuards(JwtAuthGuard)` on a handler or controller rejects unauthenticated calls
-  with `401`.
-- Modules that use the guard must import `AuthModule` (which exports `JwtModule`);
-  `forwardRef()` breaks the `AuthModule ⇄ UsersModule` circular dependency.
+### Secure cookie settings
 
-### Weakness: "secure by opt-in"
+```ts
+@Post('login')
+async login(@Body() dto: LoginDto, @Res({ passthrough: true }) res: Response) {
+  const token = await this.authService.login(dto.username, dto.password);
 
-Every new route is **public unless someone remembers** to add `@UseGuards`. This is the
-single most common cause of broken access control (OWASP A01).
+  res.cookie('__Host-access_token', token, {
+    httpOnly: true,                                  // not readable by JS
+    secure: true,                                    // HTTPS only
+    sameSite: 'strict',                              // not sent on cross-site requests
+    path: '/',
+    maxAge: this.config.getOrThrow<number>('JWT_TTL_MS'), // same source as the JWT expiry
+  });
 
-### Improvement: deny by default
+  return { success: true }; // do NOT also return the token in the body
+}
 
-Register the guard globally and explicitly mark the few public routes:
+@Post('logout')
+logout(@Res({ passthrough: true }) res: Response) {
+  res.clearCookie('__Host-access_token', { path: '/', secure: true, sameSite: 'strict' });
+  // also revoke the refresh token server-side
+}
+```
+
+Key points:
+
+- `httpOnly`, `secure` and `sameSite` should all be set explicitly.
+- If you **return the token in the response body as well**, frontend code will usually
+  store it somewhere readable, which cancels out the benefit of `httpOnly`.
+- The `__Host-` prefix makes the browser enforce `Secure`, `Path=/` and no `Domain`
+  attribute. This blocks cookie injection from subdomains.
+- Derive the cookie's `maxAge` and the JWT's `expiresIn` from the same config value so they
+  can't drift apart.
+- Prefer `@Res({ passthrough: true })`. A bare `@Res()` switches Nest to library-specific
+  mode, so interceptors and the normal return-value handling are bypassed.
+- Register `cookie-parser` (`app.use(cookieParser())`) so `req.cookies` is populated.
+
+---
+
+## 4. Authorization: deny by default, roles and ownership
+
+**Authentication** answers "who are you?" and fails with `401 Unauthorized`.
+**Authorization** answers "are you allowed to do this?" and fails with `403 Forbidden`.
+Both are required, and authentication must run first so that `request.user` exists.
+
+### 4.1 Deny by default
+
+If every route has to opt in with `@UseGuards(JwtAuthGuard)`, any route where someone
+forgets it is public. This is the most common source of **broken access control**
+(OWASP A01). Instead, register the guards globally and mark the few public routes
+explicitly:
 
 ```ts
 // public.decorator.ts
 export const IS_PUBLIC_KEY = 'isPublic';
 export const Public = () => SetMetadata(IS_PUBLIC_KEY, true);
 
-// jwt-auth.guard.ts
-canActivate(ctx: ExecutionContext) {
-  const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
-    ctx.getHandler(),
-    ctx.getClass(),
-  ]);
-  if (isPublic) return true;
-  // ...verify token
-}
-
-// app.module.ts
+// app.module.ts: global guards run in the order they are registered
 providers: [
   { provide: APP_GUARD, useClass: ThrottlerGuard },
   { provide: APP_GUARD, useClass: JwtAuthGuard },
   { provide: APP_GUARD, useClass: RolesGuard },
-];
+],
 
 // auth.controller.ts
-@Public() @Post('login') login() { ... }
+@Public()
+@Post('login')
+login() { /* ... */ }
 ```
 
-Global guards run in the order they are registered, so authentication always runs
-before authorization.
+### 4.2 Role-based access control (RBAC)
+
+```ts
+// roles.decorator.ts
+export const ROLES_KEY = 'roles';
+export const Roles = (...roles: Role[]) => SetMetadata(ROLES_KEY, roles);
+
+// roles.guard.ts
+@Injectable()
+export class RolesGuard implements CanActivate {
+  constructor(private readonly reflector: Reflector) {}
+
+  canActivate(ctx: ExecutionContext): boolean {
+    const required = this.reflector.getAllAndOverride<Role[]>(ROLES_KEY, [
+      ctx.getHandler(), // method-level @Roles() wins...
+      ctx.getClass(),   // ...otherwise fall back to controller-level @Roles()
+    ]);
+    if (!required?.length) return true;
+
+    const { user } = ctx.switchToHttp().getRequest();
+    if (!user || !required.includes(user.role)) {
+      throw new ForbiddenException();
+    }
+    return true;
+  }
+}
+```
+
+Common mistakes:
+
+- **`reflector.get(KEY, ctx.getHandler())` only reads method metadata.** A `@Roles()` on the
+  controller class is silently ignored. Use `getAllAndOverride` (or `getAllAndMerge`).
+- **Letting users choose their own role.** If a public registration DTO accepts a `role`
+  field, anyone can sign up as `admin` and RBAC is meaningless. Always assign the lowest
+  role on sign-up and change roles only through a privileged endpoint. This is a form of
+  **mass assignment**.
+- **Trusting a stale role in the token.** A demoted admin keeps `role: admin` until their
+  token expires. Use short TTLs, or load the current role from the DB or a cache in the
+  guard.
+
+### 4.3 Object-level authorization (ownership)
+
+RBAC answers "can editors delete articles?". It cannot answer "can *this* editor delete
+*this* article?". Without an ownership check, any user who guesses an ID can act on
+someone else's data. This vulnerability is called **IDOR** (Insecure Direct Object
+Reference), or BOLA in OWASP's API Top 10.
+
+```ts
+async deleteArticle(id: number, user: AuthUser) {
+  const article = await this.repo.findOne({ where: { id }, relations: { author: true } });
+  if (!article) throw new NotFoundException();
+  if (user.role !== Role.Admin && article.author.id !== user.sub) {
+    throw new ForbiddenException();
+  }
+  await this.repo.remove(article);
+}
+```
+
+For complex rules, use a policy library such as **CASL** instead of scattering `if`
+statements.
 
 ---
 
-## 4. Step 4 — Storing the JWT in an httpOnly cookie
+## 5. Input validation
 
-**Reference:** [endingState/auth.controller.ts](endingState/auth.controller.ts), [endingState/jwt-auth.guard.ts](endingState/jwt-auth.guard.ts)
+Register a global `ValidationPipe` with strict options:
 
-### What the lab teaches
+```ts
+app.useGlobalPipes(
+  new ValidationPipe({
+    whitelist: true,             // strip properties that have no decorators
+    forbidNonWhitelisted: true,  // ...and reject the request instead of silently stripping
+    transform: true,             // turn payloads into DTO class instances
+  }),
+);
+```
 
-- `cookie-parser` makes `request.cookies` available.
-- On login the token is written to an `access_token` cookie with `httpOnly: true`, so
-  JavaScript (and therefore an XSS payload) cannot read it.
-- The guard reads the token from the cookie instead of the `Authorization` header.
+Guidelines:
 
-### Trade-off to understand
-
-| Storage | XSS can steal token? | CSRF possible? |
-|---------|---------------------|----------------|
-| `localStorage` + `Authorization` header | **Yes** | No (browser never sends it automatically) |
-| `httpOnly` cookie | No | **Yes** (browser sends it automatically) → needs Step 7 |
-
-Moving to cookies trades one risk for another; that is why CSRF protection follows.
-
-### Weaknesses & improvements
-
-| # | Issue | Fix |
-|---|-------|-----|
-| 4.1 | `secure: false` — the cookie is sent over plain HTTP. | `secure: process.env.NODE_ENV === 'production'` (and serve only over HTTPS). |
-| 4.2 | No `sameSite` on the auth cookie. | `sameSite: 'strict'` (or `'lax'` if you need top-level navigations from other sites). This alone blocks most CSRF. |
-| 4.3 | The login response **also returns the token in the body** (`.send(accessToken)`), which defeats `httpOnly` — frontend code will likely store it. | Return `{ success: true }` or the user profile only. |
-| 4.4 | `maxAge` is hard-coded to 1 h, independent of `JWT_EXPIRATION`. | Derive both from the same config value. |
-| 4.5 | No logout endpoint. | `POST /auth/logout` → `res.clearCookie('access_token', sameOptions)` (+ revoke refresh token). |
-| 4.6 | Using `@Res()` switches Nest to "library-specific mode" and bypasses interceptors. | Use `@Res({ passthrough: true })` and `return` the body. |
-| 4.7 | Consider the `__Host-` cookie prefix. | `__Host-access_token` forces `Secure`, `Path=/`, no `Domain` — prevents subdomain cookie injection. |
+- Put a validator on **every** DTO field, and bound every string with `@MaxLength()` to
+  limit storage and processing cost.
+- Use `@IsEnum()` for fixed sets of values and `@IsInt()`/`@Min()` for numbers.
+- Validate path and query params too: `@Param('id', ParseIntPipe) id: number`. For
+  example, `Number('abc')` gives `NaN` rather than an error.
+- Keep separate DTOs for separate operations (`CreateUserDto`, `AdminUpdateUserDto`), so
+  that privileged fields can never be set through public endpoints.
+- Limit request body size, for example
+  `app.useBodyParser('json', { limit: '100kb' })` on a `NestExpressApplication`.
+- Validation isn't output encoding. Stored text must still be escaped wherever it is
+  rendered (see [§11](#11-security-headers-and-content-security-policy)).
 
 ---
 
-## 5. Step 5 — Role-based access control (RBAC)
+## 6. Output: don't leak sensitive data
 
-**Reference:** [endingState/roles.decorator.ts](endingState/roles.decorator.ts), [endingState/roles.guard.ts](endingState/roles.guard.ts)
+Returning ORM entities directly is one of the most common data leaks. Password hashes,
+internal flags and related entities end up in responses. Eager-loaded relations make it
+worse: an article that eagerly loads its author also returns that author's hash.
 
-### What the lab teaches
+**Option A: explicit response DTOs** (the most robust approach):
 
-- `SetMetadata(ROLES_KEY, roles)` wrapped in a `@Roles(...)` decorator attaches the
-  required roles to a handler.
-- `RolesGuard` uses `Reflector` to read that metadata and compares it with
-  `request.user.role`. Mismatch → `403 Forbidden`.
-- **Authentication (401) ≠ Authorization (403).** `JwtAuthGuard` must run first so that
-  `request.user` exists: `@UseGuards(JwtAuthGuard, RolesGuard)`.
+```ts
+return users.map((u) => ({ id: u.id, username: u.username, role: u.role }));
+```
 
-Resulting access matrix:
-
-| Endpoint | Allowed roles |
-|----------|---------------|
-| `POST /articles` | admin, editor |
-| `GET /articles` | any authenticated user |
-| `DELETE /articles/:id` | admin |
-| `GET /users` | admin |
-| `POST /users/register` | public |
-
-### Weaknesses & improvements
-
-| # | Issue | Severity | Fix |
-|---|-------|----------|-----|
-| 5.1 | **Privilege escalation at registration.** `RegisterUserDto` lets the caller choose `role: 'admin'`. Anyone can register as admin, making all RBAC meaningless. | **Critical** | Remove `role` from the public DTO; always create `UserRole.USER`. Provide a separate admin-only endpoint to change roles. |
-| 5.2 | `reflector.get(ROLES_KEY, context.getHandler())` ignores `@Roles()` placed on the **controller class**. | Medium | Use `reflector.getAllAndOverride(ROLES_KEY, [ctx.getHandler(), ctx.getClass()])`. |
-| 5.3 | Role is trusted from the JWT, so role changes only take effect after the token expires. | Medium | Short token TTL, or load the user's current role from DB/cache in the guard. |
-| 5.4 | No object-level authorization (e.g. "editors may delete **their own** articles"). RBAC alone can't express ownership; missing ownership checks are IDOR bugs. | Design | Check `article.user.id === req.user.sub` in the service, or adopt CASL / policy-based authorization. |
-| 5.5 | `:id` is converted with `Number(id)` — `"abc"` becomes `NaN`. | Low | `@Param('id', ParseIntPipe) id: number`. |
-
----
-
-## 6. Step 6 — Rate limiting with @nestjs/throttler
-
-**Reference:** [endingState/app.module.ts](endingState/app.module.ts), [endingState/articles.controller.ts](endingState/articles.controller.ts)
-
-### What the lab teaches
-
-- `ThrottlerModule.forRoot({ throttlers: [{ ttl: 20_000, limit: 5 }] })` defines a default
-  limit (TTL is in **milliseconds** in v5+).
-- `@UseGuards(ThrottlerGuard)` applies it; `@Throttle({ default: { limit, ttl } })`
-  overrides per route; `@SkipThrottle()` disables it.
-- Exceeding the limit returns `429 Too Many Requests`.
-
-### Why it matters
-
-Rate limiting mitigates brute-force login, credential stuffing, scraping and cheap
-application-level DoS.
-
-### Weaknesses & improvements
-
-| # | Issue | Fix |
-|---|-------|-----|
-| 6.1 | **`POST /auth/login` and `POST /users/register` are not throttled** — the endpoints that need it most. | Register `ThrottlerGuard` as `APP_GUARD` and put a strict limit on login (e.g. 5/min per IP + per username). |
-| 6.2 | `DELETE /articles/:id` uses `@SkipThrottle()`. Skipping limits on a destructive endpoint is the opposite of what you want. | Remove `@SkipThrottle()` there; reserve it for health checks. |
-| 6.3 | Default storage is in-memory — each instance counts separately and counters reset on restart. | Use a shared store (`@nest-lab/throttler-storage-redis`). |
-| 6.4 | Behind a reverse proxy every request appears to come from the proxy IP. | `app.set('trust proxy', 1)` (exact hop count) and/or override `getTracker()` to use user id for authenticated routes. |
-| 6.5 | Throttling is per-IP only; attackers rotate IPs. | Add per-account lockout/backoff and alerting on failed logins. |
-
----
-
-## 7. Step 7 — CSRF protection
-
-**Files:** [csrf.controller.ts](src/csrf/csrf.controller.ts), [csurf.guard.ts](src/csrf/csurf.guard.ts), [endingState/main.ts](endingState/main.ts)
-
-### What the lab teaches
-
-- Once auth lives in a cookie, a malicious site can make the victim's browser send
-  authenticated state-changing requests (Cross-Site Request Forgery).
-- The **synchronizer token** pattern: the server issues a token (`GET /csrf-token`) and
-  every `POST/PUT/DELETE` must echo it back in the `X-CSRF-Token` header. A cross-site
-  attacker can send the cookie but cannot read the token.
-- Safe methods (`GET`, `HEAD`, `OPTIONS`) are ignored — which is only correct if `GET`
-  handlers never change state.
-
-### Weaknesses & improvements
-
-| # | Issue | Fix |
-|---|-------|-----|
-| 7.1 | **`csurf` is deprecated and unmaintained** (archived by the Express team in 2022). | Migrate to `csrf-csrf` (signed double-submit cookie) or `@fastify/csrf-protection`. |
-| 7.2 | Two implementations exist: global `app.use(csurf(...))` and a `CsrfGuard` with its own `csurf({ cookie: true })` instance with weaker cookie options. | Keep one mechanism. |
-| 7.3 | `secure: false` on the CSRF secret cookie. | `secure: true` in production. |
-| 7.4 | `console.error` logs full CSRF errors. | Use Nest `Logger`, log at `warn` without request bodies. |
-| 7.5 | CSRF tokens are defence-in-depth, not the only line. | Combine with `SameSite=strict/lax` auth cookies and an `Origin`/`Sec-Fetch-Site` header check on unsafe methods. |
-
----
-
-## 8. Step 8 — CORS
-
-**Reference:** [endingState/main.ts](endingState/main.ts)
-
-### What the lab teaches
-
-- `app.enableCors()` with no options allows **any origin** — fine for a public read-only
-  API, dangerous for a cookie-authenticated one.
-- A strict config lists allowed `origin`s, `methods`, `allowedHeaders`, and sets
-  `credentials: true` so cookies are sent cross-origin.
-
-### Key understanding
-
-- CORS is **not** an access-control mechanism for your API; it only tells *browsers*
-  which origins may *read* responses. `curl` ignores it entirely.
-- `credentials: true` **must never** be combined with `origin: '*'` or with reflecting the
-  request `Origin` back unconditionally.
-
-### Improvements
-
-- Load the allow-list from configuration (`CORS_ORIGINS=https://app.example.com`) instead
-  of hard-coding it.
-- Add `PUT`/`PATCH` only if the API actually uses them — keep the list minimal.
-- Set `maxAge` for preflight caching.
-
----
-
-## 9. Step 9 — Helmet, Content Security Policy and nonces
-
-**Files:** [nonce.middleware.ts](src/nonce.middleware.ts), [csp-violations.controller.ts](src/csp-violations/csp-violations.controller.ts), [endingState/main.ts](endingState/main.ts)
-
-### What the lab teaches
-
-- `helmet()` sets a bundle of protective headers: `Content-Security-Policy`,
-  `Strict-Transport-Security`, `X-Content-Type-Options: nosniff`,
-  `X-Frame-Options: SAMEORIGIN`, `Referrer-Policy`, `Cross-Origin-*-Policy`, and removes
-  `X-Powered-By`.
-- **CSP** restricts where scripts, styles and fonts may load from. The
-  `/csp-violations` page demonstrates what is blocked: inline scripts, unknown external
-  scripts, inline `onclick` handlers, inline styles, and framing (clickjacking).
-- Three ways to allow a specific resource:
-  - **Host allow-list** — `https://nest-js-security-good.com`
-  - **Nonce** — a fresh random value per response (`randomBytes(16)`) placed in both the
-    CSP header and `<script nonce="...">`.
-  - **Hash** — `'sha256-…'` of an exact inline block (used for the inline style).
-
-### Improvements
-
-| # | Issue | Fix |
-|---|-------|-----|
-| 9.1 | No CSP violation reporting. | Add `report-to` / `report-uri` directive and an endpoint that logs reports. Roll out new policies with `Content-Security-Policy-Report-Only` first. |
-| 9.2 | Host allow-lists are weak (any script on that host, including JSONP endpoints, is allowed). | Prefer nonces + `'strict-dynamic'`; add Subresource Integrity (`integrity="sha384-…"`) on third-party scripts. |
-| 9.3 | Swagger UI at `/api` needs inline scripts/styles and may break under the CSP; it also publicly documents the attack surface. | Disable Swagger in production or protect it with auth. |
-| 9.4 | Make framing policy explicit. | `frameAncestors: ["'none'"]` unless embedding is required. |
-| 9.5 | `object-src`, `base-uri`, `form-action` are left to defaults. | Set `objectSrc: ["'none'"]`, `baseUri: ["'self'"]`, `formAction: ["'self'"]`. |
-| 9.6 | CSP is defence-in-depth. The real XSS fix is output encoding. | Article `title`/`content` are stored raw; any HTML consumer must escape them (or sanitize with DOMPurify if rich text is required). |
-
----
-
-## 10. Cross-cutting issues found in the codebase
-
-These are not tied to a single lab step but matter just as much.
-
-### 10.1 Sensitive data exposure — password hashes in responses (High)
-
-- `GET /users` returns full `User` entities **including the `password` hash**.
-- `POST /users/register` returns the saved entity, again with the hash.
-- `Article.user` is `eager: true`, so **every `GET /articles` response embeds each
-  author's password hash** — visible to any authenticated user.
-
-**Fix:** never return entities directly. Either map to response DTOs, or:
+**Option B: class-transformer serialization.**
 
 ```ts
 // user.entity.ts
-@Column({ select: false })
-@Exclude()
+@Column({ select: false }) // not loaded unless explicitly requested
+@Exclude()                 // never serialized even if loaded
 password: string;
 
 // main.ts
 app.useGlobalInterceptors(new ClassSerializerInterceptor(app.get(Reflector)));
+
+// where the hash is genuinely needed (login):
+this.repo.createQueryBuilder('u').addSelect('u.password').where('u.username = :username', { username }).getOne();
 ```
 
-`select: false` also means the hash is only loaded when explicitly requested
-(`addSelect('user.password')` in `findByUsername`).
+`ClassSerializerInterceptor` only affects **class instances**, so plain objects
+(`{ ...user }`) bypass `@Exclude()`.
 
-### 10.2 Input validation gaps (Medium)
-
-- `ValidationPipe({ whitelist: true, transform: true })` is good — it strips unknown
-  properties. Add `forbidNonWhitelisted: true` to reject them loudly.
-- `minLength: 6` exists only in the **Swagger annotation**, not as a validator. Add
-  `@MinLength(12)` (NIST 800-63B recommends ≥ 8, prefer longer) and `@MaxLength(72)` —
-  bcrypt silently ignores bytes beyond 72.
-- Add `@MaxLength` to `username`, `title`, `content` to bound storage and processing.
-- Set a JSON body limit (`app.useBodyParser('json', { limit: '100kb' })`).
-
-### 10.3 Error handling leaks internals (Medium)
-
-[articles.controller.ts](src/articles/articles.controller.ts) wraps every error in
-`new InternalServerErrorException(error.message)`, which:
-
-- sends raw DB/driver messages to the client (schema and query details), and
-- turns a legitimate `NotFoundException` into a `500`.
-
-**Fix:** let `HttpException`s propagate, and add a global exception filter that logs the
-real error server-side and returns a generic message for unknown errors.
-
-### 10.4 Database configuration (Medium)
-
-- `synchronize: true` in [app.module.ts](src/app.module.ts) lets TypeORM alter the
-  schema at startup — it can drop columns/data in production and conflicts with the
-  migrations in `src/migrations`. Set it to `false` and use migrations only.
-- Use a least-privilege DB user for the app (no `DROP`/`ALTER`), and a separate one for
-  migrations.
-- `compose.yaml` falls back to the password `newsroom`. Require it via `${DB_PASS:?}` so a
-  missing value fails loudly. (Binding Postgres to `127.0.0.1` is already done — good.)
-- TypeORM's repository API is parameterised, which prevents SQL injection; keep it that
-  way and never build raw queries with string concatenation.
-
-### 10.5 Dependencies / supply chain (Medium)
-
-- `crypto` in `package.json` is a deprecated npm placeholder — Node's built-in `crypto`
-  is what the code actually uses. Remove it: unnecessary packages are attack surface.
-- `csurf` is deprecated (see 7.1). `passport`, `passport-jwt`, `@nestjs/passport` and
-  `cheerio` appear unused at runtime — remove or move to `devDependencies`.
-- Run `npm audit`, enable Dependabot/Renovate, and commit the lockfile (already done).
-
-### 10.6 Configuration & secrets
-
-- `.env` is correctly git-ignored and `.env.example` contains placeholders — good.
-- Validate all config at startup with a schema so the app refuses to boot with missing or
-  weak values.
-- In production load secrets from a secret manager (AWS Secrets Manager, Vault, Doppler)
-  rather than files.
-
-### 10.7 Logging & monitoring
-
-- Replace `console.error` with Nest's `Logger` (or pino) and structured logs.
-- Log security events: failed logins, 401/403/429 spikes, role changes, CSRF failures,
-  CSP reports. Never log passwords, tokens or full cookies.
-
-### 10.8 Transport
-
-- Serve only over HTTPS; Helmet's HSTS header only has effect over TLS.
-- If behind a load balancer, configure `trust proxy` correctly (affects rate limiting,
-  `secure` cookies and `req.ip`).
+Also avoid eager relations unless you really need them, and never return tokens,
+secrets, or internal IDs that clients have no use for.
 
 ---
 
-## 11. Prioritised improvement backlog
+## 7. Error handling
 
-| Priority | Item | Section |
-|----------|------|---------|
-| 🔴 Critical | Remove `role` from public registration | 5.1 |
-| 🔴 High | Stop returning password hashes (`/users`, `/register`, eager `Article.user`) | 10.1 |
-| 🔴 High | Throttle `/auth/login` and `/users/register` | 6.1 |
-| 🔴 High | Deny-by-default global guards + `@Public()` | 3 |
-| 🟠 Medium | Generic login errors + constant-time path | 2.1, 2.2 |
-| 🟠 Medium | `secure` + `sameSite` cookies, don't return token in body, add logout | 4.x |
-| 🟠 Medium | Replace deprecated `csurf`; keep one CSRF mechanism | 7.1, 7.2 |
-| 🟠 Medium | `synchronize: false`, migrations only | 10.4 |
-| 🟠 Medium | Stop leaking `error.message`; global exception filter | 10.3 |
-| 🟠 Medium | Real password validators (`@MinLength`, `@MaxLength`) | 10.2 |
-| 🟡 Low | Pin JWT algorithm, add `iss`/`aud`, check `Bearer` scheme | 2.3–2.5 |
-| 🟡 Low | `getAllAndOverride` in `RolesGuard`, `ParseIntPipe` | 5.2, 5.5 |
-| 🟡 Low | Remove `@SkipThrottle()` from DELETE; Redis throttler storage | 6.2, 6.3 |
-| 🟡 Low | CSP reporting, `frame-ancestors 'none'`, disable Swagger in prod | 9.x |
-| 🟡 Low | Remove unused/deprecated dependencies, enable `npm audit` in CI | 10.5 |
+A common anti-pattern:
+
+```ts
+catch (error) {
+  throw new InternalServerErrorException(error.message); // ❌
+}
+```
+
+This has two problems:
+
+1. It sends raw database or driver messages to the client, which exposes table names,
+   constraints and query fragments.
+2. It turns meaningful `HttpException`s (such as `NotFoundException`) into `500`s.
+
+Better:
+
+- Let `HttpException`s propagate unchanged.
+- Add a global exception filter that logs the full error server-side and returns a
+  generic message for anything unexpected:
+
+```ts
+@Catch()
+export class AllExceptionsFilter implements ExceptionFilter {
+  private readonly logger = new Logger(AllExceptionsFilter.name);
+
+  catch(exception: unknown, host: ArgumentsHost) {
+    const res = host.switchToHttp().getResponse<Response>();
+    if (exception instanceof HttpException) {
+      return res.status(exception.getStatus()).json(exception.getResponse());
+    }
+    this.logger.error(exception);
+    res.status(500).json({ statusCode: 500, message: 'Internal server error' });
+  }
+}
+```
+
+- Never expose stack traces in production.
 
 ---
 
-## 12. General security principles to take away
+## 8. Rate limiting
 
-1. **Deny by default.** Public access should be the explicit exception, not the
-   accidental result of a forgotten decorator.
-2. **Authentication ≠ Authorization.** "Who are you?" (401) and "are you allowed?" (403)
-   are separate checks — and authorization includes *object ownership*, not just roles.
-3. **Never trust client input** — not the body, not the role the user claims, not the
-   `Origin` header. Validate on the server with whitelists.
-4. **Defence in depth.** SameSite cookies + CSRF tokens + Origin checks; output encoding
-   + CSP; rate limiting + account lockout. Each layer covers the others' gaps.
-5. **Least privilege** for users, tokens (short TTL, minimal claims), DB accounts, and
-   dependencies.
-6. **Fail securely and quietly.** Errors should be generic to the client and detailed in
-   the logs. Config errors should stop the app from starting.
-7. **Minimise what you return.** Responses are an API contract — use DTOs, never raw
+Rate limiting mitigates brute-force login, credential stuffing, scraping and cheap
+application-level DoS. In NestJS, use `@nestjs/throttler`:
+
+```ts
+// app.module.ts
+ThrottlerModule.forRoot([{ ttl: 60_000, limit: 100 }]), // ttl is in milliseconds (v5+)
+providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
+
+// stricter limit on sensitive endpoints
+@Throttle({ default: { limit: 5, ttl: 60_000 } })
+@Post('login')
+login() { /* ... */ }
+
+// exempt only what really needs it (e.g. health checks)
+@SkipThrottle()
+@Get('health')
+health() { /* ... */ }
+```
+
+Guidelines:
+
+- **Apply limits globally** and make them strictest on authentication, registration,
+  password reset and anything that sends email or SMS.
+- Don't `@SkipThrottle()` destructive or expensive endpoints.
+- The default in-memory store is per-process and resets on restart. With more than one
+  instance, use a shared store (for example Redis via `@nest-lab/throttler-storage-redis`).
+- Behind a reverse proxy every request appears to come from the proxy's IP. Configure
+  `app.set('trust proxy', <hops>)` correctly, or override `getTracker()` to key on the
+  user ID for authenticated routes.
+- Per-IP limits are easy to get around by rotating IPs. Add per-account throttling or
+  exponential backoff after failed logins, and alert on spikes.
+
+---
+
+## 9. CSRF protection
+
+### What CSRF is
+
+When authentication relies on something the browser sends **automatically** (cookies,
+HTTP Basic auth), a malicious site can make the victim's browser send authenticated
+requests to your API. Your API can't tell those requests apart from genuine ones.
+
+APIs authenticated purely by an `Authorization` header set from JavaScript are **not**
+vulnerable to CSRF, because browsers never attach that header automatically.
+
+### Defences (use several)
+
+1. **`SameSite` cookies.** `SameSite=Strict` or `Lax` stops the browser sending the cookie
+   on cross-site sub-requests. This is the strongest single measure, but it doesn't
+   protect against attacks from sibling subdomains (same *site*, different *origin*).
+2. **Anti-CSRF tokens.**
+   - *Synchronizer token*: the server stores a token in the session and the client sends
+     it back in a header (for example `X-CSRF-Token`).
+   - *Signed double-submit cookie*: the server sets a token in a cookie and the client
+     echoes it in a header. The token must be **signed or tied to the session**; an
+     unsigned double-submit can be defeated by cookie injection.
+   - An attacker can make the browser *send* cookies but cannot *read* the token, so they
+     can't forge the header.
+3. **Origin checks.** On unsafe methods, reject requests whose `Origin` (or
+   `Sec-Fetch-Site`) header isn't in your allow-list.
+4. **Never change state on `GET`.** CSRF middleware normally skips safe methods
+   (`GET`, `HEAD`, `OPTIONS`), so a state-changing `GET` has no protection at all.
+
+### Library choice
+
+The once-popular `csurf` package is **deprecated and unmaintained**, so don't use it in
+new code. Maintained alternatives include `csrf-csrf` (signed double-submit for Express)
+and `@fastify/csrf-protection`. Use one mechanism consistently. Two overlapping
+implementations with different cookie options are hard to reason about.
+
+---
+
+## 10. CORS
+
+### What CORS actually does
+
+By default, the browser's **same-origin policy** stops JavaScript on `site-a.com` from
+reading responses from `api.site-b.com`. CORS lets a server **relax** that restriction for
+specific origins.
+
+- CORS is **not** access control for your API. It only tells browsers which origins may
+  *read* responses. Tools like `curl` and server-side scripts ignore it completely.
+- A request that CORS "blocks" is often still **sent and executed**; only reading the
+  response is blocked. So CORS doesn't replace CSRF protection.
+
+### Configuration
+
+```ts
+app.enableCors({
+  origin: config.getOrThrow<string>('CORS_ORIGINS').split(','), // explicit allow-list
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],                    // only what you use
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token'],
+  credentials: true,  // needed only if the browser must send cookies cross-origin
+  maxAge: 600,        // cache preflight responses
+});
+```
+
+Common mistakes:
+
+- `app.enableCors()` with no options allows **every** origin.
+- Reflecting the request's `Origin` back unconditionally while also using
+  `credentials: true` lets any website make authenticated reads of your API.
+- Allowing `null` as an origin (sandboxed iframes and `file://` pages send it).
+- Loose regexes such as `/example\.com$/`, which also match `evil-example.com`.
+
+---
+
+## 11. Security headers and Content Security Policy
+
+### Helmet
+
+`helmet` sets a set of protective HTTP headers in one call:
+
+| Header | Protects against |
+|--------|------------------|
+| `Content-Security-Policy` | XSS and injection of scripts, styles, frames |
+| `Strict-Transport-Security` | Protocol downgrade and SSL stripping (only effective over HTTPS) |
+| `X-Content-Type-Options: nosniff` | MIME-type confusion |
+| `X-Frame-Options` / `frame-ancestors` | Clickjacking |
+| `Referrer-Policy` | Leaking URLs to third parties |
+| `Cross-Origin-Opener/Resource-Policy` | Cross-origin data leaks |
+| *(removes)* `X-Powered-By` | Technology fingerprinting |
+
+### Content Security Policy
+
+CSP tells the browser which sources of scripts, styles, fonts, frames and so on are
+allowed. By default it blocks **inline scripts, inline event handlers (`onclick="…"`),
+inline styles, `eval`, and any source not listed**.
+
+There are three ways to allow a specific resource:
+
+| Method | Example | Notes |
+|--------|---------|-------|
+| **Host allow-list** | `script-src https://cdn.example.com` | Weakest: *any* script on that host is allowed, including JSONP endpoints or user uploads. |
+| **Nonce** | `script-src 'nonce-R4nd0m'` + `<script nonce="R4nd0m">` | A fresh cryptographically random value on every response. Must never be reused or predictable. |
+| **Hash** | `style-src 'sha256-…'` | Allows one exact inline block. Changing a single character breaks it. |
+
+A per-request nonce in NestJS:
+
+```ts
+// nonce.middleware.ts
+@Injectable()
+export class CspNonceMiddleware implements NestMiddleware {
+  use(_req: Request, res: Response, next: NextFunction) {
+    res.locals.cspNonce = randomBytes(16).toString('base64');
+    next();
+  }
+}
+
+// main.ts (the nonce middleware must run before helmet)
+app.use(new CspNonceMiddleware().use);
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", (_req, res: Response) => `'nonce-${res.locals.cspNonce}'`],
+        styleSrc: ["'self'"],
+        objectSrc: ["'none'"],
+        baseUri: ["'self'"],
+        formAction: ["'self'"],
+        frameAncestors: ["'none'"],
+      },
+    },
+  }),
+);
+```
+
+Guidelines:
+
+- Prefer **nonces or hashes** (optionally with `'strict-dynamic'`) over host allow-lists.
+- Add **Subresource Integrity** (`integrity="sha384-…"`) to third-party scripts and
+  stylesheets, so a compromised CDN can't swap in malicious code.
+- Always set `object-src 'none'`, `base-uri 'self'` and `frame-ancestors`.
+- Roll out a new policy with `Content-Security-Policy-Report-Only` and a `report-to` /
+  `report-uri` endpoint first, fix the violations, then enforce it.
+- Tools such as Swagger UI need their own relaxed policy. Better still, don't expose API
+  docs publicly in production.
+- CSP is **defence in depth**. The primary XSS defence is still context-aware output
+  encoding (templating engines, React's JSX escaping). Sanitize user-provided HTML with a
+  library such as DOMPurify.
+
+---
+
+## 12. Database security
+
+- **Turn off schema auto-sync in production.** TypeORM's `synchronize: true` alters the
+  schema on startup and can drop columns and data. Use versioned **migrations** instead.
+- **Use parameterised queries.** ORM repository methods and QueryBuilder with `:params`
+  are safe. Never build SQL by string concatenation or interpolation:
+
+  ```ts
+  // ❌ SQL injection
+  repo.query(`SELECT * FROM users WHERE name = '${name}'`);
+  // ✅ parameterised
+  repo.createQueryBuilder('u').where('u.name = :name', { name }).getMany();
+  ```
+
+- **Grant least privilege.** The app's DB user needs only data access (no
+  `DROP`/`ALTER`/superuser). Run migrations with a separate account.
+- **Restrict the network.** Don't expose the database port publicly; bind it to
+  localhost or a private network.
+- **Fail when credentials are missing.** Defaults such as `${DB_PASS:-password}` in
+  Compose files hide misconfiguration. Prefer `${DB_PASS:?DB_PASS is required}`.
+- Encrypt connections (`ssl`) when the DB isn't on the same host, and encrypt backups.
+
+---
+
+## 13. Configuration and secrets
+
+- Never commit secrets. Keep `.env` in `.gitignore` and commit only a `.env.example` with
+  placeholders.
+- **Validate configuration at startup** so the app refuses to boot with missing or weak
+  values:
+
+  ```ts
+  ConfigModule.forRoot({
+    isGlobal: true,
+    validationSchema: Joi.object({
+      NODE_ENV: Joi.string().valid('development', 'production', 'test').required(),
+      JWT_SECRET: Joi.string().min(32).required(),
+      DB_PASS: Joi.string().required(),
+    }),
+  });
+  ```
+
+- Use `configService.getOrThrow()` for required values instead of `get()`, which can
+  silently return `undefined`.
+- In production, load secrets from a secret manager (AWS Secrets Manager, GCP Secret
+  Manager, HashiCorp Vault) and rotate them regularly.
+- Use different secrets for each environment.
+
+---
+
+## 14. Dependencies and supply chain
+
+- Remove unused packages; every dependency adds attack surface.
+- Watch for **placeholder or look-alike packages**. For example, `crypto` on npm is a
+  deprecated stub. Node's built-in `crypto` module needs no install.
+- Replace **deprecated security libraries** (such as `csurf`), which no longer get fixes.
+- Commit the lockfile and install with `npm ci` in CI.
+- Run `npm audit` (or Snyk, or GitHub Dependabot) in CI, and automate updates with
+  Renovate or Dependabot.
+- Keep NestJS, Node.js and the ORM on supported versions.
+
+---
+
+## 15. Logging and monitoring
+
+- Use Nest's `Logger` or a structured logger (pino, winston) instead of `console.*`.
+- Log security-relevant events: failed and successful logins, `401`/`403`/`429` spikes,
+  role and permission changes, CSRF failures, CSP violation reports, and admin actions.
+- **Never log** passwords, tokens, full cookies, or other secrets and sensitive personal
+  data.
+- Send logs to a central system and alert on anomalies. Detecting an attack is part of
+  defending against it (OWASP A09).
+
+---
+
+## 16. Transport and deployment
+
+- Serve **only over HTTPS**. HSTS, `Secure` cookies and `__Host-` prefixes all depend on
+  it.
+- Behind a load balancer or reverse proxy, set `trust proxy` to the exact number of hops.
+  It affects `req.ip`, rate limiting and `secure` cookie handling.
+- Disable or protect API documentation (Swagger) in production.
+- Run the process as a non-root user in a minimal container image.
+- Set `NODE_ENV=production` and turn off debug features and verbose errors.
+
+---
+
+## 17. Hardening checklist
+
+| Priority | Item |
+|----------|------|
+| 🔴 Critical | Users can't choose their own role or other privileged fields (mass assignment) |
+| 🔴 Critical | Guards apply by default; public routes are explicitly marked `@Public()` |
+| 🔴 High | Password hashes and other secrets never appear in responses (DTOs or `@Exclude` + `select: false`) |
+| 🔴 High | Login, registration and password reset are rate-limited |
+| 🔴 High | Object-level ownership checks on every resource accessed by ID |
+| 🟠 Medium | Generic login errors with timing-equalised verification |
+| 🟠 Medium | Auth cookies are `httpOnly`, `Secure`, `SameSite`, with no token in the response body, plus a logout endpoint |
+| 🟠 Medium | CSRF protection with a maintained library, plus `SameSite` and Origin checks |
+| 🟠 Medium | `synchronize: false` in production; migrations only |
+| 🟠 Medium | Global exception filter; no raw error messages or stack traces to clients |
+| 🟠 Medium | Strict `ValidationPipe`, length limits on every string, body size limit |
+| 🟡 Low | JWT algorithm pinned, `iss`/`aud` verified, short TTL, revocation strategy |
+| 🟡 Low | `getAllAndOverride` for role metadata; `ParseIntPipe` on numeric params |
+| 🟡 Low | Shared rate-limit store and correct `trust proxy` in multi-instance deployments |
+| 🟡 Low | CSP with nonces, `frame-ancestors 'none'`, reporting; Swagger off in production |
+| 🟡 Low | Config validated at startup; secrets in a secret manager |
+| 🟡 Low | Unused and deprecated dependencies removed; `npm audit` in CI |
+
+---
+
+## 18. General principles
+
+1. **Deny by default.** Public access should be a deliberate exception, never the result
+   of a forgotten decorator.
+2. **Authentication ≠ authorization.** "Who are you?" (401) and "are you allowed?" (403)
+   are separate checks, and authorization includes *object ownership*, not just roles.
+3. **Never trust client input.** That includes the body, the role a user claims, IDs in
+   the URL, and headers. Validate on the server against allow-lists.
+4. **Use defence in depth.** SameSite cookies + CSRF tokens + Origin checks; output
+   encoding + CSP; rate limiting + account lockout. Each layer covers gaps in the others.
+5. **Apply least privilege** to users, tokens (short TTL, minimal claims), database
+   accounts, containers and dependencies.
+6. **Fail securely.** Clients get generic errors; logs get the details. Bad config should
+   stop the app from starting.
+7. **Return as little as possible.** Responses are a contract, so use DTOs, not raw
    entities.
-8. **Every control has a trade-off.** Cookies fix XSS token theft but introduce CSRF;
-   CORS relaxes the same-origin policy; `@SkipThrottle` removes protection. Know what you
-   are trading.
-9. **Keep dependencies alive.** Deprecated security libraries (like `csurf`) stop
-   receiving fixes; audit and update continuously.
-10. **Map to OWASP.** The issues above correspond to OWASP Top 10: A01 Broken Access
-    Control (5.1, 3, 5.4), A02 Cryptographic Failures (4.1, 10.1), A04 Insecure Design
-    (2.7), A05 Security Misconfiguration (10.4, 9.x), A06 Vulnerable Components (10.5),
-    A07 Identification & Authentication Failures (2.x, 6.1), A09 Logging & Monitoring
-    Failures (10.7).
+8. **Know the trade-offs.** Cookies protect tokens from XSS but introduce CSRF. CORS
+   relaxes the same-origin policy. Every exemption (`@SkipThrottle`, `@Public`) removes a
+   protection.
+9. **Keep dependencies maintained.** Abandoned security libraries stop receiving fixes.
+10. **Map your controls to OWASP.** The OWASP Top 10 and the OWASP API Security Top 10 are
+    good checklists: A01 Broken Access Control, A02 Cryptographic Failures, A03
+    Injection, A04 Insecure Design, A05 Security Misconfiguration, A06 Vulnerable
+    Components, A07 Identification & Authentication Failures, A09 Logging & Monitoring
+    Failures.
