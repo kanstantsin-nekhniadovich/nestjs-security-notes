@@ -1,15 +1,3 @@
-# NestJS Security Lab — Lessons Learned & Hardening Guide
-
-This document summarises what the **Newsroom API** lab teaches about securing a NestJS
-application, explains *why* each control exists, and lists the weaknesses that are still
-present in the lab code (both `src/` and the reference `endingState/`) together with
-concrete improvements.
-
-> The lab is a teaching project. Several shortcuts are deliberate. Treat the
-> "Improvements" sections as the checklist for turning it into something you could deploy.
-
----
-
 ## Table of contents
 
 1. [Big picture: the request pipeline](#1-big-picture-the-request-pipeline)
